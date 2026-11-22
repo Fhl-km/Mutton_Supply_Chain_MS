@@ -30,7 +30,7 @@ from mscm import config
 from mscm.core import repo
 from mscm.core.db import JsonStore
 from mscm.core.models import today
-from mscm.ui import icons, theme
+from mscm.ui import icons, theme, update_ui
 from mscm.ui.context import AppContext
 from mscm.ui.nav import (
     NavBrand, NavFooter, NavGroupItem, NavLeafButton, NavSection, NavStoreItem,
@@ -642,6 +642,7 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------- 关闭
     def closeEvent(self, event) -> None:      # noqa: N802
         try:
+            update_ui.stop_all()
             self.conn.commit()
         finally:
             super().closeEvent(event)

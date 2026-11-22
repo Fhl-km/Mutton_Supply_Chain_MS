@@ -1,4 +1,4 @@
-"""系统设置：数据文件、备份、整套台账导出、示例数据与清空。"""
+"""系统设置：数据文件、备份、整套台账导出、示例数据、软件更新与清空。"""
 
 from __future__ import annotations
 
@@ -6,11 +6,12 @@ import os
 import subprocess
 from pathlib import Path
 
-from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout
+from PySide6.QtWidgets import QCheckBox, QGridLayout, QHBoxLayout, QVBoxLayout
 
 from mscm import config
 from mscm.core import bootstrap, repo
 from mscm.core.services import export as xl_export
+from mscm.ui import update_ui
 from mscm.ui.dialogs import confirm, info
 from mscm.ui.widgets import Card, Combo, DateEdit, PageBase, button, label
 
@@ -91,6 +92,26 @@ class SettingsPage(PageBase):
         card3.add(note)
         root.addWidget(card3)
 
+        # ---------------- 软件更新 ----------------
+        card_up = Card("软件更新", f"当前版本 v{config.APP_VERSION}")
+        row_up = QHBoxLayout()
+        row_up.setSpacing(10)
+        self.auto_update_box = QCheckBox("自动更新")
+        self.auto_update_box.setChecked(update_ui.auto_update_enabled(ctx.conn))
+        self.auto_update_box.setToolTip("勾选后每次启动都会在后台检查新版本，发现后提示下载安装")
+        self.auto_update_box.toggled.connect(self._on_auto_update)
+        self.update_btn = button("检查更新", "", self._on_check_update,
+                                 tip="联网检查是否有新版本")
+        row_up.addWidget(self.auto_update_box)
+        row_up.addWidget(self.update_btn)
+        row_up.addStretch(1)
+        card_up.add_layout(row_up)
+        if not config.UPDATE_CHECK_URL.strip():
+            hint = label("尚未配置更新地址，配置后即可使用自动更新。", "Muted")
+            hint.setWordWrap(True)
+            card_up.add(hint)
+        root.addWidget(card_up)
+
         # ---------------- 关于 ----------------
         card4 = Card("关于", "")
         about = label(
@@ -120,6 +141,13 @@ class SettingsPage(PageBase):
         idx = self.store_combo.findData(keep or 0)
         self.store_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.store_combo.blockSignals(False)
+
+    # ---------------------------------------------------------- 软件更新
+    def _on_auto_update(self, checked: bool) -> None:
+        update_ui.set_auto_update(self.ctx.conn, checked)
+
+    def _on_check_update(self) -> None:
+        update_ui.start_check(self, self.update_btn)
 
     # ---------------------------------------------------------- 动作
     @staticmethod
