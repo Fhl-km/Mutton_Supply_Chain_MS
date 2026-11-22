@@ -16,8 +16,9 @@ name: 打包 羊供应链管理系统（Nuitka + Inno Setup → setup.exe）
 #   · concurrency 只让同分支的新任务排队，不取消、不删除在跑的任务；
 #   · 步骤里的 Remove-Item 只清理本次 run 工作区里的临时目录 / 临时 zip。
 #
-# 版本口径：显示版本取源码 src/mscm/config.py 的 APP_VERSION（唯一真源）；
-#   文件属性版本必须是纯数字 a.b.c.d，用 APP_VERSION.运行编号 拼出（如 1.6.0.42）。
+# 版本口径：显示版本只认源码 src/mscm/config.py 的 APP_VERSION（唯一真源，不接受外部覆盖 ——
+#   安装包版本和 exe 里编进去的版本必须是同一个数，否则客户端会「永远有新版本」）；
+#   文件属性版本必须是纯数字 a.b.c.d 且每段 ≤65535，用「主.次.运行编号」拼出（如 1.6.42）。
 #
 # 图标：项目目前没有 .ico，icon_path 留空即可；将来把图标放进仓库后填相对路径，
 #       打包会自动带上 --windows-icon-from-ico，并把同一个图标用于安装向导。
@@ -32,10 +33,6 @@ on:
         description: '构建所用 Python 版本'
         required: false
         default: '3.13'
-      app_version:
-        description: '显示版本（留空 = 自动取 src/mscm/config.py 的 APP_VERSION）'
-        required: false
-        default: ''
       icon_path:
         description: '【预留】图标 .ico 路径（相对仓库根目录，如 src/mscm/ui/assets/app.ico）；留空 = 不设置图标'
         required: false
@@ -51,6 +48,37 @@ on:
         required: false
         type: choice
         options: ['false', 'true']
+        default: 'false'
+
+  # 供 release.yml 调用（全流程发版里复用同一套打包步骤，避免两份脚本各自漂移）。
+  # workflow_call 的 input 不支持 choice，布尔项一律用 string。
+  workflow_call:
+    inputs:
+      python_version:
+        description: '构建所用 Python 版本'
+        required: false
+        type: string
+        default: '3.13'
+      # 发版流程专用：按「写完版本号的那个提交」检出，别用触发本次运行的旧提交
+      source_ref:
+        description: '检出用的 ref（留空 = 触发本次运行的分支/提交）'
+        required: false
+        type: string
+        default: ''
+      icon_path:
+        description: '图标 .ico 路径（相对仓库根目录）；留空 = 不设置图标'
+        required: false
+        type: string
+        default: ''
+      upload_portable_zip:
+        description: '是否额外上传便携版 zip'
+        required: false
+        type: string
+        default: 'false'
+      upload_debug_artifact:
+        description: '是否额外上传 main.dist 原始构建目录'
+        required: false
+        type: string
         default: 'false'
 
 # 同一分支的手动任务排队执行；cancel-in-progress=false 保证不会取消/清掉已有运行
@@ -83,6 +111,11 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          # 发版流程会把版本号先 commit 到分支，再用那个提交的 sha 调这里：
+          # 否则打包用的是「触发时的旧提交」，exe 里 config.APP_VERSION 还是老版本，
+          # 装完一启动就提示有更新 → 死循环。手动打包时留空，按当前 ref 检出。
+          ref: ${{ inputs.source_ref || github.ref }}
 
       - name: 设置 Python ${{ inputs.python_version }}
         uses: actions/setup-python@v5
@@ -95,13 +128,14 @@ jobs:
       - name: 解析版本号与产物名称
         id: meta
         env:
-          IN_VERSION: ${{ inputs.app_version }}
           IN_ICON: ${{ inputs.icon_path }}
         run: |
           $ErrorActionPreference = 'Stop'
           $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
-          # 显示版本唯一真源：src/mscm/config.py 的 APP_VERSION
+          # 显示版本唯一真源：src/mscm/config.py 的 APP_VERSION。
+          # 这里**不接受**外部覆盖 —— exe 里编译进去的就是这个值，
+          # 安装包另写一个版本号会让客户端「永远觉得有新版本」，死循环。
           $cfgPath = Join-Path $env:GITHUB_WORKSPACE 'src\mscm\config.py'
           if (-not (Test-Path $cfgPath)) { throw "找不到配置：$cfgPath" }
           $cfg = Get-Content $cfgPath -Raw -Encoding UTF8
@@ -110,15 +144,21 @@ jobs:
           }
           $codeVersion = $Matches[1].Trim()
 
-          $override = ([string]$Env:IN_VERSION).Trim()
-          $version = if ($override) { $override } else { $codeVersion }
+          $version = $codeVersion
           # 显示版本可以带后缀（1.6.0 / 2026.11），文件版本必须纯数字
           $numeric = ($version -replace '[^0-9.]', '')
           $parts = @($numeric.Split('.') | Where-Object { $_ -ne '' })
-          if ($parts.Count -lt 2) { throw "版本号无法转成数字版本：$version" }
-          while ($parts.Count -lt 3) { $parts += '0' }
-          if ($parts.Count -gt 3) { Write-Host "[WARN] 版本号 $version 超过 3 段，文件版本只取前三段（第 4 段留给运行编号）" }
-          $fileVersion = ($parts[0..2] -join '.') + ".$env:GITHUB_RUN_NUMBER"
+          # 显示版本可能长成 1.6.202611221726（发布流程：两位主版本 + 打包时间戳），
+          # 但 exe 的文件版本每段只能是 0~65535 —— 直接塞年份+时分秒会被 Inno 拒。
+          # 所以文件版本只取前两段 + 运行编号（1.6.42），永远合法且递增。
+          if ($parts.Count -lt 2) { throw "版本号至少要有两段（主.次 / 主.次.时间戳）：$version" }
+          $major = [int64]$parts[0]
+          $minor = [int64]$parts[1]
+          if ($major -gt 65535 -or $minor -gt 65535) { throw "版本号前两位超出 65535：$version" }
+          if ([int64]$env:GITHUB_RUN_NUMBER -gt 65535) {
+            Write-Host "[WARN] 运行编号 $env:GITHUB_RUN_NUMBER 超过 65535，文件版本会不合法"
+          }
+          $fileVersion = "$major.$minor.$env:GITHUB_RUN_NUMBER"
 
           # 图标为预留输入：留空则完全不传 --windows-icon-from-ico
           $icon = ([string]$Env:IN_ICON).Trim()
@@ -213,12 +253,14 @@ jobs:
           & $venvPy -c "import sys, importlib.metadata as md, PySide6, openpyxl, mscm; print('Python', sys.version.split()[0]); [print(n, md.version(n)) for n in ('PySide6','openpyxl','nuitka','mutton-supply-chain-ms')]"
           if ($LASTEXITCODE -ne 0) { throw '依赖自检失败' }
 
-          # 运行时再读一次版本：与 meta 步骤的正则解析结果对账，防止改了源码没对上
+          # 运行时再读一次版本：与 meta 步骤的正则解析结果对账。
+          # 不一致说明 import 到的不是这份源码（常见于缓存恢复的 .venv 里还是旧的 editable 安装），
+          # 编出来的 exe 会显示老版本，客户端就会「永远有新版本」——这种必须当场挡住。
           $runtimeVersion = (& $venvPy -c "import mscm.config as c; print(c.APP_VERSION)").Trim()
           if ($LASTEXITCODE -ne 0) { throw '读取源码版本号失败' }
-          Write-Host "源码版本（运行时读取）：$runtimeVersion / 本次使用：$env:APP_VERSION"
+          Write-Host "源码版本（运行时读取）：$runtimeVersion / 配置文件声明：$env:CODE_VERSION"
           if ($runtimeVersion -ne $env:CODE_VERSION) {
-            Write-Host "[WARN] 运行时版本 $runtimeVersion 与解析值 $env:CODE_VERSION 不一致"
+            throw "版本号对不上：运行时 import 到的 mscm 是 $runtimeVersion，而 config.py 写的是 $env:CODE_VERSION。请检查 .venv 缓存 / pip install -e . 是否装的是这份源码。"
           }
 
           [System.IO.File]::AppendAllLines($env:GITHUB_ENV, [string[]]@("PYTHON_VENV=$venvPy"), (New-Object System.Text.UTF8Encoding $false))

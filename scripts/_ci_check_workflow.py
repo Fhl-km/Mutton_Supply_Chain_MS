@@ -10,6 +10,7 @@ Windows runner 用 pwsh（PS7），本机只有 Windows PowerShell 5.1；两者�
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -68,7 +69,8 @@ def _run(files: list[Path], TMP: Path) -> int:
         for i, (label, script) in enumerate(runs):
             safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)[:60]
             ps1 = TMP / f"{path.stem}_{i:02d}_{safe}.ps1"
-            ps1.write_text(script, encoding="utf-8-sig")
+            # ${{ ... }} 是 GitHub 在执行前替换掉的表达式，PowerShell 自己解析会报错：先换成占位符
+            ps1.write_text(re.sub(r"\$\{\{[^}]*\}\}", "__GH_EXPR__", script), encoding="utf-8-sig")
             jobs.append({"label": label, "path": str(ps1)})
 
     payload = TMP / "_check.json"

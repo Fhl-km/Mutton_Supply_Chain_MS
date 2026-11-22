@@ -1,0 +1,471 @@
+name: 发布 羊供应链管理系统（版本号写回 → 打包 → Release → 更新清单）
+
+# 触发方式：Actions 页面手动点 "Run workflow"。一条命令走完全流程：
+#
+#   ① 算版本号：`主.次.打包时间(北京时间 yyyyMMddHHmm)`，例如 1.6.202611221726
+#      主.次 取自 src/mscm/config.py 的 APP_VERSION 前两段（首发是 1.6.0 → 1.6）
+#   ② 把版本号写回 src/mscm/config.py（连带 __init__.py、pyproject.toml 对齐）
+#      并 commit + push 到当前运行分支（默认 main）
+#   ③ 调用 package.yml 打包（Nuitka standalone → Inno Setup → Mutton_Supply_Chain_MS_setup.exe）
+#      注意：打包必须按「刚写完版本号的那个提交」检出（source_ref 传 sha），
+#      否则 exe 里编进去的还是旧版本号，装完一启动就提示有更新 —— 死循环。
+#   ④ 建 Release：tag = v{版本号}，发布说明 = 上一个 tag 之后的全部提交说明
+#   ⑤ 更新 FHLwebsite 仓库的 Mutton_Supply_Chain_MS_check_update.txt
+#      → Cloudflare Pages（https://fhlwebsite.pages.dev/...）对外提供，客户端据此自动更新
+#
+# 版本号规则为什么这么写：
+#   · 显示版本可以有四段以上的大数字（时间戳），inno 的 AppVersion 是纯文本，照收；
+#   · exe 文件属性版本每段必须 0~65535，所以 package.yml 只取前两段 + 运行编号（1.6.42）；
+#   · 客户端比较版本走 mscm.check_update._version_tuple，纯数字逐段数值比较，
+#     时间戳越大就越新 —— 不需要人对版本号做任何判断。
+#
+# 前置条件（只需配一次）：
+#   · 仓库 Secret `FHLWEBSITE_TOKEN`：fine-grained PAT，只授权 Fhl-km/FHLwebsite 的
+#     Contents: Read and write。没有它也能发版，只是第 ⑤ 步会跳过并把内容打进摘要。
+#   · FHLwebsite 仓库已接入 Cloudflare Pages（当前 txt 地址已可读，说明已接好）。
+#
+# ⚠️ Release 资产对匿名下载可见，取决于本仓库可见性：
+#   仓库是 private 时，`releases/download/...` 直链对客户端是 404。
+#   要么把本仓库转 public，要么用下面的 installer_url 输入改指到公开托管（如 R2 / COS）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      write_back:
+        description: '是否把版本号提交并推送回运行分支（关掉 = 只本地打包，不污染历史）'
+        required: false
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      update_check:
+        description: '是否更新 FHLwebsite 的更新清单（需要 Secret FHLWEBSITE_TOKEN）'
+        required: false
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      prerelease:
+        description: '是否标为预发布（预发布不写更新清单，客户端不会自动升级）'
+        required: false
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      installer_url:
+        description: '安装包直链（留空 = 本仓库 v{版本}/Mutton_Supply_Chain_MS_setup.exe）'
+        required: false
+        default: ''
+      icon_path:
+        description: '【预留】图标 .ico 路径（相对仓库根目录）；留空 = 不设置图标'
+        required: false
+        default: ''
+
+concurrency:
+  group: mscm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+# 需要写权限：版本号回写要 push 提交，Release 要建 tag
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: 'utf-8'
+  PIP_PROGRESS_BAR: 'off'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  # 更新清单所在仓库与文件（改这两个变量就能换托管位置）
+  WEBSITE_REPO: Fhl-km/FHLwebsite
+  WEBSITE_BRANCH: main
+  UPDATE_FILE: Mutton_Supply_Chain_MS_check_update.txt
+  UPDATE_URL: https://fhlwebsite.pages.dev/Mutton_Supply_Chain_MS_check_update.txt
+  APP_EXE_NAME: Mutton_Supply_Chain_MS
+  SETUP_NAME: Mutton_Supply_Chain_MS_setup.exe
+
+jobs:
+  # ==================================================================
+  # 1. 算版本号 · 生成发布说明 · 版本号写回分支
+  # ==================================================================
+  prepare:
+    name: 算版本号并写回分支
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      prev_tag: ${{ steps.meta.outputs.prev_tag }}
+      notes: ${{ steps.meta.outputs.notes }}
+      installer_url: ${{ steps.meta.outputs.installer_url }}
+      stamp: ${{ steps.meta.outputs.stamp }}
+      # 写回后的提交 sha：打包必须用它，不能用触发本次运行的旧提交
+      sha: ${{ steps.commit.outputs.sha }}
+
+    steps:
+      - name: 检出代码（要全量历史，才能算「上次发布之后」的提交）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 用 GITHUB_TOKEN 推回写提交；它推的提交不会再触发工作流，不会自激
+          persist-credentials: true
+
+      - name: 解析版本号 / 上次发布 / 发布说明
+        id: meta
+        env:
+          IN_INSTALLER_URL: ${{ inputs.installer_url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          # 提交说明里有中文：固定按 UTF-8 解码 git 的 stdout，否则「输入网址」这类
+          # 中文提交信息会被控制台代码页（cp437/cp936）抓成乱码写进 Release 说明
+          try { [Console]::OutputEncoding = $utf8NoBom } catch { }
+          $OutputEncoding = $utf8NoBom
+
+          # ---- 主.次：只认 config.py 前两段 --------------------------------
+          $cfgPath = Join-Path $env:GITHUB_WORKSPACE 'src\mscm\config.py'
+          if (-not (Test-Path $cfgPath)) { throw "找不到配置：$cfgPath" }
+          $cfg = Get-Content $cfgPath -Raw -Encoding UTF8
+          if ($cfg -notmatch '(?m)^\s*APP_VERSION\s*=\s*"([^"]+)"') {
+            throw 'src/mscm/config.py 里没解析到 APP_VERSION'
+          }
+          $curVersion = $Matches[1].Trim()
+          $segs = @($curVersion.Split('.') | Where-Object { $_ -ne '' })
+          if ($segs.Count -lt 2) { throw "config.py 的 APP_VERSION 至少要两段（主.次）：$curVersion" }
+          $base = "$($segs[0]).$($segs[1])"
+
+          # ---- 打包时间：北京时间，与 config 里写的口径一致 -----------------
+          $tz   = [System.TimeZoneInfo]::FindSystemTimeZoneById('China Standard Time')
+          $now  = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
+          $version = "$base.$($now.ToString('yyyyMMddHHmm'))"
+          $stampCn = $now.ToString('yyyy-MM-dd HH:mm')
+          $tag = "v$version"
+
+          # 同一分钟内重复跑会撞 tag：直接挡住，别让 Release 建到一半失败
+          git fetch --tags --force --quiet
+          $exist = git rev-parse -q --verify "refs/tags/$tag"
+          if ($LASTEXITCODE -eq 0 -and $exist) {
+            throw "标签 $tag 已存在（同一分钟内重复发布）。等一分钟再跑，或先删除该 tag。"
+          }
+
+          # ---- 上次发布：按版本号倒序取第一个 v* tag ------------------------
+          $prevTag = ''
+          $allTags = @(git tag --list 'v*' --sort=-v:refname)
+          if ($allTags.Count -gt 0) { $prevTag = $allTags[0] }
+          Write-Host "上次发布：$(if ($prevTag) { $prevTag } else { '（无，本次是首次发布）' })"
+
+          # ---- 发布说明：上次 tag 之后的提交（排除发版自身的 chore 提交）----
+          $range = if ($prevTag) { "$prevTag..HEAD" } else { 'HEAD' }
+          $logLines = @(git log $range --no-merges --invert-grep --grep='^chore\(release\)' '--pretty=format:- %s（%h）' -n 300)
+          if ($LASTEXITCODE -ne 0) { throw '生成提交说明失败' }
+          $notes = if ($logLines.Count -gt 0) { ($logLines -join "`n") } else { '- 本次无新增提交' }
+          Write-Host "提交条数：$($logLines.Count)"
+
+          # ---- 安装包直链 ------------------------------------------------
+          $url = ([string]$Env:IN_INSTALLER_URL).Trim()
+          if (-not $url) {
+            $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$env:SETUP_NAME"
+          }
+
+          # ---- 版本号写回（config.py 为准，另两个跟着对齐以免版本漂移）------
+          $newCfg = [regex]::Replace($cfg, '(?m)^APP_VERSION\s*=\s*"[^"]*"', "APP_VERSION = `"$version`"")
+          if ($newCfg -eq $cfg) { throw 'APP_VERSION 替换没生效，请检查 config.py 的写法' }
+
+          $pyproject = Join-Path $env:GITHUB_WORKSPACE 'pyproject.toml'
+          if (Test-Path $pyproject) {
+            $pp = Get-Content $pyproject -Raw -Encoding UTF8
+            # 实例方法才有「只替换 count 处」的重载；project.version 只认第一处
+            $pp2 = ([regex]::new('(?m)^version\s*=\s*"[^"]*"')).Replace($pp, "version = `"$version`"", 1)
+            if ($pp2 -ne $pp) { [System.IO.File]::WriteAllText($pyproject, $pp2, $utf8NoBom) }
+          }
+          $initPy = Join-Path $env:GITHUB_WORKSPACE 'src\mscm\__init__.py'
+          if (Test-Path $initPy) {
+            $ip = Get-Content $initPy -Raw -Encoding UTF8
+            $ip2 = [regex]::Replace($ip, '(?m)^__version__\s*=\s*"[^"]*"', "__version__ = `"$version`"")
+            if ($ip2 -ne $ip) { [System.IO.File]::WriteAllText($initPy, $ip2, $utf8NoBom) }
+          }
+          [System.IO.File]::WriteAllText($cfgPath, $newCfg, $utf8NoBom)
+          Write-Host "版本号：$curVersion → $version"
+
+          # ---- 输出 ------------------------------------------------------
+          $map = [ordered]@{
+            VERSION       = $version
+            TAG           = $tag
+            PREV_TAG      = $prevTag
+            INSTALLER_URL = $url
+            STAMP_CN      = $stampCn
+          }
+          foreach ($k in $map.Keys) {
+            [System.IO.File]::AppendAllLines($env:GITHUB_ENV, [string[]]@("$k=$($map[$k])"), $utf8NoBom)
+            Write-Host "$k = $($map[$k])"
+          }
+          [System.IO.File]::AppendAllLines($env:GITHUB_OUTPUT, [string[]]@(
+            "version=$version", "tag=$tag", "prev_tag=$prevTag", "installer_url=$url", "stamp=$stampCn"
+          ), $utf8NoBom)
+          # 发布说明是多行文本：用 heredoc 语法塞进 step output
+          [System.IO.File]::AppendAllLines($env:GITHUB_OUTPUT, [string[]]@('notes<<MSCM_NOTES_EOF'), $utf8NoBom)
+          [System.IO.File]::AppendAllLines($env:GITHUB_OUTPUT, [string[]]@($notes), $utf8NoBom)
+          [System.IO.File]::AppendAllLines($env:GITHUB_OUTPUT, [string[]]@('MSCM_NOTES_EOF'), $utf8NoBom)
+
+      - name: 版本号写回并推送
+        id: commit
+        if: ${{ inputs.write_back == 'true' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/mscm/config.py src/mscm/__init__.py pyproject.toml
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host '版本号没有变化，跳过提交'
+            exit 0
+          }
+          git commit -m "chore(release): $env:TAG"
+          if ($LASTEXITCODE -ne 0) { throw '提交版本号失败' }
+          # 直接推到触发本次运行的同一分支
+          git push origin "HEAD:$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw "推送版本号失败（分支 $env:GITHUB_REF_NAME 是否有保护规则？）" }
+          $sha = (git rev-parse HEAD).Trim()
+          Write-Host "已推送：$sha $(git log -1 --pretty=format:'%s')"
+          # 打包要用这个提交（含新版本号），不能用触发运行的旧提交
+          [System.IO.File]::AppendAllLines($env:GITHUB_OUTPUT, [string[]]@("sha=$sha"), (New-Object System.Text.UTF8Encoding $false))
+
+      - name: 写入准备阶段摘要
+        env:
+          WRITE_BACK: ${{ inputs.write_back }}
+        run: |
+          $prevLabel = if ($env:PREV_TAG) { '`' + $env:PREV_TAG + '`' } else { '（无，首次发布）' }
+          $lines = @(
+            "## 发版准备：$env:VERSION",
+            '',
+            "- 上次发布：$prevLabel",
+            "- 本次标签：``$env:TAG``",
+            "- 打包时间：$env:STAMP_CN（北京时间）",
+            "- 版本号写回分支：$env:WRITE_BACK",
+            "- 安装包直链：$env:INSTALLER_URL",
+            ''
+          )
+          [System.IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, [string[]]$lines, (New-Object System.Text.UTF8Encoding $false))
+
+  # ==================================================================
+  # 2. 打包（复用 package.yml，一套步骤两处用，不会各自漂移）
+  # ==================================================================
+  build:
+    name: 打包安装包
+    needs: prepare
+    permissions:
+      contents: read
+    uses: ./.github/workflows/package.yml
+    with:
+      python_version: '3.13'
+      # 关键：按「刚刚写了版本号的那个提交」打包，版本号才会被编进 exe
+      source_ref: ${{ needs.prepare.outputs.sha }}
+      icon_path: ${{ inputs.icon_path }}
+      upload_portable_zip: 'false'
+      upload_debug_artifact: 'false'
+
+  # ==================================================================
+  # 3. 发 Release + 更新自动更新清单
+  # ==================================================================
+  publish:
+    name: 发布 Release 并更新清单
+    needs: [prepare, build]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: 检出代码（发布说明兜底要用 tag 历史）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 取回安装包
+        uses: actions/download-artifact@v4
+        with:
+          name: Mutton_Supply_Chain_MS_setup
+          path: release
+
+      - name: 校验安装包并算摘要
+        id: setup
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Join-Path $env:GITHUB_WORKSPACE "release\$env:SETUP_NAME"
+          if (-not (Test-Path $setup)) {
+            Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE 'release') -Recurse | ForEach-Object { Write-Host $_.FullName }
+            throw "artifact 里没有 $env:SETUP_NAME"
+          }
+          $size = (Get-Item $setup).Length
+          $mb = [math]::Round($size / 1MB, 1)
+          $sha = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          Write-Host "安装包：$env:SETUP_NAME（$mb MB）"
+          Write-Host "SHA256：$sha"
+          [System.IO.File]::AppendAllLines($env:GITHUB_ENV, [string[]]@("SETUP_SIZE_MB=$mb", "SETUP_SHA256=$sha"), (New-Object System.Text.UTF8Encoding $false))
+          [System.IO.File]::AppendAllLines($env:GITHUB_OUTPUT, [string[]]@("sha256=$sha"), (New-Object System.Text.UTF8Encoding $false))
+
+      - name: 提醒仓库可见性（Release 直链要匿名可下）
+        run: |
+          # 教程/客户端的下载请求不带 token，private 仓库的 release 资产对它们是 404
+          $vis = ''
+          try { $vis = (gh api "repos/$env:GITHUB_REPOSITORY" --jq '.visibility' 2>$null) } catch { }
+          if ($vis -ne 'public') {
+            Write-Host "::warning::本仓库可见性为「$vis」：Release 直链对客户端不可匿名下载，自动更新会拿不到安装包。请把仓库转 public，或用 installer_url 输入指向公开托管。"
+          } else {
+            Write-Host "仓库可见性：public，Release 直链可匿名下载"
+          }
+
+      - name: 写发布说明
+        env:
+          NOTES: ${{ needs.prepare.outputs.notes }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREV_TAG: ${{ needs.prepare.outputs.prev_tag }}
+          STAMP_CN: ${{ needs.prepare.outputs.stamp }}
+          INSTALLER_URL: ${{ needs.prepare.outputs.installer_url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lines = New-Object System.Collections.Generic.List[string]
+          $lines.Add("## 羊供应链管理系统 $env:VERSION")
+          $lines.Add('')
+          $lines.Add("**打包时间**：$env:STAMP_CN（北京时间）　**上次发布**：$(if ($env:PREV_TAG) { $env:PREV_TAG } else { '首次发布' })")
+          $lines.Add('')
+          $lines.Add('### 本次提交')
+          $lines.Add('')
+          foreach ($ln in ($env:NOTES -split "`r?`n")) { $lines.Add($ln.TrimEnd()) }
+          $lines.Add('')
+          $lines.Add('### 安装包')
+          $lines.Add('')
+          $lines.Add("- 文件：``$env:SETUP_NAME``（$env:SETUP_SIZE_MB MB）")
+          $lines.Add("- 下载：$env:INSTALLER_URL")
+          $lines.Add("- SHA-256：``$env:SETUP_SHA256``")
+          $lines.Add('')
+          $lines.Add('### 升级方式')
+          $lines.Add('')
+          $lines.Add("- 老版本在「系统设置 › 软件更新」点检查更新即可自动下载安装；")
+          $lines.Add("- 也可以直接下上面的安装包覆盖安装，账套数据在 ``data\`` 里，不会被覆盖。")
+          [System.IO.File]::WriteAllLines((Join-Path $env:GITHUB_WORKSPACE 'release-notes.md'), $lines.ToArray(), (New-Object System.Text.UTF8Encoding $false))
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: 羊供应链管理 ${{ needs.prepare.outputs.version }}
+          body_path: release-notes.md
+          files: release/Mutton_Supply_Chain_MS_setup.exe
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ inputs.prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 更新 FHLwebsite 的自动更新清单
+        if: ${{ inputs.update_check == 'true' && inputs.prerelease != 'true' }}
+        env:
+          WEBSITE_TOKEN: ${{ secrets.FHLWEBSITE_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          INSTALLER_URL: ${{ needs.prepare.outputs.installer_url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          $summary = New-Object System.Collections.Generic.List[string]
+
+          # 客户端格式（mscm.check_update.parse_text）：一行三段，空白分隔
+          #   <版本号> <安装包直链> <64位小写 sha256>
+          $content = "$env:VERSION $env:INSTALLER_URL $env:SETUP_SHA256"
+          Write-Host "清单内容：$content"
+
+          if ([string]::IsNullOrWhiteSpace($env:WEBSITE_TOKEN)) {
+            Write-Host '::warning::没有配置 Secret FHLWEBSITE_TOKEN，跳过自动更新清单；内容已写进摘要，可手工提交'
+            $summary.Add('### ⚠️ 自动更新清单未写入（缺 Secret FHLWEBSITE_TOKEN）')
+            $summary.Add('')
+            $summary.Add('把那行内容手工写进 `' + $env:UPDATE_FILE + '`（FHLwebsite 仓库）：')
+            $summary.Add('')
+            $summary.Add('```')
+            $summary.Add($content)
+            $summary.Add('```')
+            [System.IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, $summary.ToArray(), $utf8NoBom)
+            exit 0
+          }
+
+          $headers = @{
+            Authorization          = "Bearer $env:WEBSITE_TOKEN"
+            Accept                 = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent'           = 'mscm-release-workflow'
+          }
+          $api = "https://api.github.com/repos/$env:WEBSITE_REPO/contents/$env:UPDATE_FILE"
+          $failed = $null
+
+          # Release 已经发出去了，这一步失败不该把整次运行标红：只告警 + 把内容打进摘要，手工补也可
+          try {
+            # 先取现有文件拿 sha（更新已有文件必须带 sha，否则 422）
+            $fileSha = $null
+            try {
+              $cur = Invoke-RestMethod -Uri "${api}?ref=$env:WEBSITE_BRANCH" -Headers $headers -Method Get
+              $fileSha = $cur.sha
+              Write-Host "已存在同名文件（blob $fileSha），将覆盖更新"
+            } catch {
+              $code = $_.Exception.Response.StatusCode.value__
+              if ($code -ne 404) { throw "读取清单失败（HTTP $code）：$($_.Exception.Message)" }
+              Write-Host '远端还没有这个文件，将新建'
+            }
+
+            $body = [ordered]@{
+              message = "chore: 羊供应链管理更新清单 → $env:TAG"
+              content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($content + "`n"))
+              branch  = $env:WEBSITE_BRANCH
+            }
+            if ($fileSha) { $body.sha = $fileSha }
+
+            $res = Invoke-RestMethod -Uri $api -Headers $headers -Method Put `
+                     -ContentType 'application/json; charset=utf-8' `
+                     -Body ([Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Compress)))
+            Write-Host "已提交：$($res.commit.html_url)"
+          } catch {
+            $failed = $_.Exception.Message
+            Write-Host "::warning::写更新清单失败：$failed"
+          }
+
+          if ($failed) {
+            $summary.Add('### ⚠️ Release 已发布，但自动更新清单没写进去')
+            $summary.Add('')
+            $summary.Add("失败原因：$failed")
+            $summary.Add('')
+            $summary.Add("先查 Secret ``FHLWEBSITE_TOKEN`` 是否对 ``$env:WEBSITE_REPO`` 有 Contents: write；")
+            $summary.Add("也可以把这行手工写进 ``$env:UPDATE_FILE``：")
+            $summary.Add('')
+            $summary.Add('```')
+            $summary.Add($content)
+            $summary.Add('```')
+          } else {
+            $summary.Add('### ✅ 自动更新清单已更新')
+            $summary.Add('')
+            $summary.Add("- 仓库：``$env:WEBSITE_REPO`` / ``$env:UPDATE_FILE``")
+            $summary.Add("- 内容：``$content``")
+            $summary.Add("- 客户端读取地址：$env:UPDATE_URL")
+            $summary.Add('- Cloudflare Pages 会在这次提交后重新构建，通常 1 分钟内生效')
+          }
+          [System.IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, $summary.ToArray(), $utf8NoBom)
+
+      - name: 写入发布摘要
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PREV_TAG: ${{ needs.prepare.outputs.prev_tag }}
+          INSTALLER_URL: ${{ needs.prepare.outputs.installer_url }}
+        run: |
+          $lines = @(
+            "## ✅ 已发布：羊供应链管理 $env:VERSION",
+            '',
+            "| 项目 | 内容 |",
+            "|---|---|",
+            "| 标签 | ``$env:TAG`` |",
+            "| 安装包 | ``$env:SETUP_NAME``（$env:SETUP_SIZE_MB MB） |",
+            "| SHA-256 | ``$env:SETUP_SHA256`` |",
+            "| 下载直链 | $env:INSTALLER_URL |",
+            "| 发布说明 | 上次发布（$(if ($env:PREV_TAG) { $env:PREV_TAG } else { '首次' })）之后的全部提交 |",
+            "| 更新清单 | $env:UPDATE_URL |",
+            '',
+            '> 客户端「系统设置 › 软件更新」会在下次检查时看到这个版本；账套数据保存在 `data\`，覆盖安装不会动。'
+          )
+          [System.IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, [string[]]$lines, (New-Object System.Text.UTF8Encoding $false))

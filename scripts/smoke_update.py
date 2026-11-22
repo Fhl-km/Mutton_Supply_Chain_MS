@@ -54,9 +54,14 @@ ok("远端较旧 → 无需更新", check_update._same_or_older("1.5.9", "1.6.0"
 ok("位数不齐补齐", check_update._same_or_older("1.6", "1.6.0") is True)
 
 print("[3] 未配置安全返回")
+# 正式发版后 config.UPDATE_CHECK_URL 会填真实地址（发版流程会自动写更新清单），
+# 这里临时清空，专测「没配地址时必须安静地返回 error」这条分支
+_saved_url = config.UPDATE_CHECK_URL
+config.UPDATE_CHECK_URL = ""
 ok("configured 为 False", check_update.configured() is False)
 res = check_update.check()
 ok("check 返回 error", res["status"] == check_update.ERROR, res["detail"])
+config.UPDATE_CHECK_URL = _saved_url
 
 print("[4] 设置开关持久化")
 conn = open_database(TMP / "data" / "ui.mscm.json")
@@ -86,7 +91,9 @@ app.processEvents()
 ok("未配置时自动检查静默返回", True)
 
 ok("预览版判定", check_update.is_preview_version() is False)
-ok("版本取 config", config.APP_VERSION == "1.6.0")
+# 版本号会被发版流程写成 主.次.时间戳（如 1.6.202611221726），不能硬编码具体值
+_v = config.APP_VERSION
+ok("版本取 config", _v.count(".") >= 1 and _v.split(".")[0].isdigit() and _v.split(".")[1].isdigit(), _v)
 
 print("[RESULT]", "OK" if not fails else "FAIL: " + ", ".join(fails))
 sys.exit(0 if not fails else 1)
