@@ -359,6 +359,21 @@ jobs:
           New-Item -ItemType Directory -Path $appDir -Force | Out-Null
           Copy-Item (Join-Path $dist '*') $appDir -Recurse -Force
 
+          # 安全闸：产物目录里绝不能出现 data\ / 导出报表\ / *.mscm.json。
+          # 一旦出现，说明有人在构建目录里跑过程序 —— 打出去既是账套泄漏，
+          # 装的时候还可能把用户的账套按「安装文件」覆盖掉。宁可构建失败。
+          $stray = New-Object System.Collections.Generic.List[string]
+          foreach ($sub in @('data', '导出报表')) {
+            if (Test-Path (Join-Path $appDir $sub)) { $stray.Add($sub) }
+          }
+          foreach ($f in @(Get-ChildItem $appDir -Recurse -File -Filter '*.mscm.json' -ErrorAction SilentlyContinue)) {
+            $stray.Add($f.FullName.Substring($appDir.Length + 1))
+          }
+          if ($stray.Count -gt 0) {
+            throw "打包目录里混进了账套数据：$($stray -join ', ')。构建目录（main.dist）里跑过程序，请先清干净再重跑 —— 绝不能把账套打进安装包。"
+          }
+          Write-Host '安全闸通过：产物目录里没有任何账套数据'
+
           $lines = New-Object System.Collections.Generic.List[string]
           $lines.Add('羊供应链管理系统（Mutton Supply Chain MS）')
           $lines.Add('活羊采购 · 屠宰 · 门店 一体化台账')

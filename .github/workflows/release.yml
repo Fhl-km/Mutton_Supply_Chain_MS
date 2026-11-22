@@ -24,9 +24,7 @@ name: 发布 羊供应链管理系统（版本号写回 → 打包 → Release �
 #     Contents: Read and write。没有它也能发版，只是第 ⑤ 步会跳过并把内容打进摘要。
 #   · FHLwebsite 仓库已接入 Cloudflare Pages（当前 txt 地址已可读，说明已接好）。
 #
-# ⚠️ Release 资产对匿名下载可见，取决于本仓库可见性：
-#   仓库是 private 时，`releases/download/...` 直链对客户端是 404。
-#   要么把本仓库转 public，要么用下面的 installer_url 输入改指到公开托管（如 R2 / COS）。
+# 安装包直链默认指向本仓库 Release；若改用别的公开托管，填 installer_url 输入即可。
 
 on:
   workflow_dispatch:
@@ -303,17 +301,6 @@ jobs:
           [System.IO.File]::AppendAllLines($env:GITHUB_ENV, [string[]]@("SETUP_SIZE_MB=$mb", "SETUP_SHA256=$sha"), (New-Object System.Text.UTF8Encoding $false))
           [System.IO.File]::AppendAllLines($env:GITHUB_OUTPUT, [string[]]@("sha256=$sha"), (New-Object System.Text.UTF8Encoding $false))
 
-      - name: 提醒仓库可见性（Release 直链要匿名可下）
-        run: |
-          # 教程/客户端的下载请求不带 token，private 仓库的 release 资产对它们是 404
-          $vis = ''
-          try { $vis = (gh api "repos/$env:GITHUB_REPOSITORY" --jq '.visibility' 2>$null) } catch { }
-          if ($vis -ne 'public') {
-            Write-Host "::warning::本仓库可见性为「$vis」：Release 直链对客户端不可匿名下载，自动更新会拿不到安装包。请把仓库转 public，或用 installer_url 输入指向公开托管。"
-          } else {
-            Write-Host "仓库可见性：public，Release 直链可匿名下载"
-          }
-
       - name: 写发布说明
         env:
           NOTES: ${{ needs.prepare.outputs.notes }}
@@ -369,9 +356,10 @@ jobs:
           $utf8NoBom = New-Object System.Text.UTF8Encoding $false
           $summary = New-Object System.Collections.Generic.List[string]
 
-          # 客户端格式（mscm.check_update.parse_text）：一行三段，空白分隔
-          #   <版本号> <安装包直链> <64位小写 sha256>
-          $content = "$env:VERSION $env:INSTALLER_URL $env:SETUP_SHA256"
+          # 客户端格式（mscm.check_update.parse_text）：一行两段，空白分隔
+          #   <版本号> <安装包直链>
+          # 第三段 sha256 客户端支持但不写（不写就不做摘要校验，靠 HTTPS + 安装包自身完整性）
+          $content = "$env:VERSION $env:INSTALLER_URL"
           Write-Host "清单内容：$content"
 
           if ([string]::IsNullOrWhiteSpace($env:WEBSITE_TOKEN)) {
