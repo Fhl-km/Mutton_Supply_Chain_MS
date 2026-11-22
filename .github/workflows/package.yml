@@ -1,0 +1,505 @@
+name: 打包 羊供应链管理系统（Nuitka + Inno Setup → setup.exe）
+
+# 触发方式：Actions 页面手动点 "Run workflow"，不挂 push / PR / 定时
+# （手动触发才跑，避免每次提交都吃掉 20 分钟的构建额度）。
+#
+# 产物：Mutton_Supply_Chain_MS_setup.exe —— 一步装好的 Windows 安装包，
+#       内置 Python 运行时与 Qt，用户机器上不需要装 Python。
+#       可选：便携版 zip（解压即用，默认关闭）。
+#
+# 命名口径（与仓库要求一致）：
+#   exe / 安装目录 / 安装包文件名 = Mutton_Supply_Chain_MS
+#   桌面、开始菜单、控制面板里显示的中文名 = 羊供应链管理
+#
+# ⚠️ 本流程不删除任何既有产物与运行记录：
+#   · Artifact 名固定，但 Artifact 按 run 独立存放，历次产物并列保留；
+#   · concurrency 只让同分支的新任务排队，不取消、不删除在跑的任务；
+#   · 步骤里的 Remove-Item 只清理本次 run 工作区里的临时目录 / 临时 zip。
+#
+# 版本口径：显示版本取源码 src/mscm/config.py 的 APP_VERSION（唯一真源）；
+#   文件属性版本必须是纯数字 a.b.c.d，用 APP_VERSION.运行编号 拼出（如 1.6.0.42）。
+#
+# 图标：项目目前没有 .ico，icon_path 留空即可；将来把图标放进仓库后填相对路径，
+#       打包会自动带上 --windows-icon-from-ico，并把同一个图标用于安装向导。
+#
+# 权限：主程序 exe 不带管理员提权（台账工具不该每次弹 UAC），
+#       安装时用管理员装进 Program Files，并由安装脚本预先给 data\ 与 导出报表\ 授权。
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: '构建所用 Python 版本'
+        required: false
+        default: '3.13'
+      app_version:
+        description: '显示版本（留空 = 自动取 src/mscm/config.py 的 APP_VERSION）'
+        required: false
+        default: ''
+      icon_path:
+        description: '【预留】图标 .ico 路径（相对仓库根目录，如 src/mscm/ui/assets/app.ico）；留空 = 不设置图标'
+        required: false
+        default: ''
+      upload_portable_zip:
+        description: '是否额外上传便携版 zip（解压即用，不含安装）'
+        required: false
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      upload_debug_artifact:
+        description: '是否额外上传 main.dist 原始构建目录（排查用，体积大）'
+        required: false
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+
+# 同一分支的手动任务排队执行；cancel-in-progress=false 保证不会取消/清掉已有运行
+concurrency:
+  group: mscm-package-${{ github.ref }}
+  cancel-in-progress: false
+
+# 只读源码即可；上传 Artifact 用运行时的 ACTIONS_RUNTIME_TOKEN，不需要 actions 写权限
+permissions:
+  contents: read
+
+# Windows runner 控制台代码页是 cp1252：pip / Nuitka 输出中文（含中文路径的 xlsx、
+# 中文参数）会触发 UnicodeEncodeError，表现为「安装依赖失败」而真因被盖掉。
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: 'utf-8'
+  PIP_PROGRESS_BAR: 'off'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  build:
+    name: 构建安装包
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      # ------------------------------------------------------------------
+      # 0. 版本号与产物名称（不依赖虚拟环境，直接读源码常量）
+      # ------------------------------------------------------------------
+      - name: 解析版本号与产物名称
+        id: meta
+        env:
+          IN_VERSION: ${{ inputs.app_version }}
+          IN_ICON: ${{ inputs.icon_path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+          # 显示版本唯一真源：src/mscm/config.py 的 APP_VERSION
+          $cfgPath = Join-Path $env:GITHUB_WORKSPACE 'src\mscm\config.py'
+          if (-not (Test-Path $cfgPath)) { throw "找不到配置：$cfgPath" }
+          $cfg = Get-Content $cfgPath -Raw -Encoding UTF8
+          if ($cfg -notmatch '(?m)^\s*APP_VERSION\s*=\s*"([^"]+)"') {
+            throw 'src/mscm/config.py 里没解析到 APP_VERSION'
+          }
+          $codeVersion = $Matches[1].Trim()
+
+          $override = ([string]$Env:IN_VERSION).Trim()
+          $version = if ($override) { $override } else { $codeVersion }
+          # 显示版本可以带后缀（1.6.0 / 2026.11），文件版本必须纯数字
+          $numeric = ($version -replace '[^0-9.]', '')
+          $parts = @($numeric.Split('.') | Where-Object { $_ -ne '' })
+          if ($parts.Count -lt 2) { throw "版本号无法转成数字版本：$version" }
+          while ($parts.Count -lt 3) { $parts += '0' }
+          if ($parts.Count -gt 3) { Write-Host "[WARN] 版本号 $version 超过 3 段，文件版本只取前三段（第 4 段留给运行编号）" }
+          $fileVersion = ($parts[0..2] -join '.') + ".$env:GITHUB_RUN_NUMBER"
+
+          # 图标为预留输入：留空则完全不传 --windows-icon-from-ico
+          $icon = ([string]$Env:IN_ICON).Trim()
+          $iconFull = ''
+          if (-not [string]::IsNullOrWhiteSpace($icon)) {
+            if ([System.IO.Path]::IsPathRooted($icon)) { throw "图标路径请填相对仓库根目录的路径：$icon" }
+            $iconFull = [System.IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE $icon))
+            if (-not (Test-Path $iconFull)) { throw "找不到图标文件：$iconFull" }
+            if ([System.IO.Path]::GetExtension($iconFull).ToLower() -ne '.ico') { throw "图标必须是 .ico：$iconFull" }
+            Write-Host "使用图标：$iconFull"
+          } else {
+            Write-Host '未指定图标：跳过图标参数（当前项目暂无 .ico）'
+          }
+
+          $builtAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
+          $map = [ordered]@{
+            APP_VERSION   = $version
+            CODE_VERSION  = $codeVersion
+            FILE_VERSION  = $fileVersion
+            BUILT_AT      = $builtAt
+            APP_EXE_NAME  = 'Mutton_Supply_Chain_MS'
+            ICON_FULL     = $iconFull
+            SETUP_BASE    = 'Mutton_Supply_Chain_MS_setup'
+            SETUP_NAME    = 'Mutton_Supply_Chain_MS_setup.exe'
+            ZIP_NAME      = 'Mutton_Supply_Chain_MS_portable.zip'
+            ARTIFACT_NAME = 'Mutton_Supply_Chain_MS_setup'
+            DIST_ARTIFACT = 'Mutton_Supply_Chain_MS_dist'
+          }
+          # 显式按「无 BOM 的 UTF-8」写 GITHUB_ENV，避免环境变量被 BOM 污染
+          foreach ($k in $map.Keys) {
+            [System.IO.File]::AppendAllLines($env:GITHUB_ENV, [string[]]@("$k=$($map[$k])"), $utf8NoBom)
+            Write-Host "$k = $($map[$k])"
+          }
+          [System.IO.File]::AppendAllLines($env:GITHUB_OUTPUT, [string[]]@(
+            "artifact_name=$($map.ARTIFACT_NAME)",
+            "dist_artifact_name=$($map.DIST_ARTIFACT)",
+            "app_exe_name=$($map.APP_EXE_NAME)"
+          ), $utf8NoBom)
+
+      # ------------------------------------------------------------------
+      # 1. 依赖与缓存（缓存只加速构建，不删除任何历史产物 / 运行记录）
+      # ------------------------------------------------------------------
+      - name: 缓存 pip 下载
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: 缓存 Nuitka 辅助工具
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\Nuitka
+          key: ${{ runner.os }}-nuitka-tools
+
+      - name: 缓存虚拟环境（依赖）
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: ${{ runner.os }}-venv-${{ inputs.python_version }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-${{ inputs.python_version }}-
+
+      - name: 准备虚拟环境与依赖
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $venv   = Join-Path $env:GITHUB_WORKSPACE '.venv'
+          $venvPy = Join-Path $venv 'Scripts\python.exe'
+
+          # 步骤内再兜一层 UTF-8，保证 pip 子进程按 UTF-8 读写 stdio
+          $env:PYTHONUTF8 = '1'
+          $env:PYTHONIOENCODING = 'utf-8'
+          $env:PIP_PROGRESS_BAR = 'off'
+          $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
+          try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
+
+          if (-not (Test-Path $venvPy)) {
+            python -m venv $venv
+            if ($LASTEXITCODE -ne 0) { throw '创建虚拟环境失败' }
+          }
+          & $venvPy -m pip install --upgrade pip --progress-bar off --no-input
+          if ($LASTEXITCODE -ne 0) { throw '升级 pip 失败' }
+
+          # 运行依赖只认 pyproject.toml（PySide6 / openpyxl）
+          & $venvPy -m pip install --progress-bar off --no-input -e .
+          if ($LASTEXITCODE -ne 0) { throw '安装项目依赖失败' }
+          # 打包器不属于运行依赖，单独装；不锁版本，避免与 Nuitka 大版本绑死
+          & $venvPy -m pip install --progress-bar off --no-input nuitka
+          if ($LASTEXITCODE -ne 0) { throw '安装 Nuitka 失败' }
+
+          & $venvPy -c "import sys, importlib.metadata as md, PySide6, openpyxl, mscm; print('Python', sys.version.split()[0]); [print(n, md.version(n)) for n in ('PySide6','openpyxl','nuitka','mutton-supply-chain-ms')]"
+          if ($LASTEXITCODE -ne 0) { throw '依赖自检失败' }
+
+          # 运行时再读一次版本：与 meta 步骤的正则解析结果对账，防止改了源码没对上
+          $runtimeVersion = (& $venvPy -c "import mscm.config as c; print(c.APP_VERSION)").Trim()
+          if ($LASTEXITCODE -ne 0) { throw '读取源码版本号失败' }
+          Write-Host "源码版本（运行时读取）：$runtimeVersion / 本次使用：$env:APP_VERSION"
+          if ($runtimeVersion -ne $env:CODE_VERSION) {
+            Write-Host "[WARN] 运行时版本 $runtimeVersion 与解析值 $env:CODE_VERSION 不一致"
+          }
+
+          [System.IO.File]::AppendAllLines($env:GITHUB_ENV, [string[]]@("PYTHON_VENV=$venvPy"), (New-Object System.Text.UTF8Encoding $false))
+
+      # ------------------------------------------------------------------
+      # 2. Nuitka 独立打包（产物 = main.dist，含 Python 与 Qt 运行时）
+      # ------------------------------------------------------------------
+      # 缓存键里带 exe 名：Nuitka 把 result_exe 写进 SCons 命令行，名称一变就会全量重编
+      - name: 缓存 Nuitka 构建目录
+        uses: actions/cache@v4
+        with:
+          path: main.build
+          key: ${{ runner.os }}-nuitka-build-${{ inputs.python_version }}-${{ steps.meta.outputs.app_exe_name }}-${{ hashFiles('src/**/*.py', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-nuitka-build-${{ inputs.python_version }}-${{ steps.meta.outputs.app_exe_name }}-
+
+      - name: Nuitka 独立打包
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # ⚠️ 新版 setuptools 的可编辑安装是 finder 形式，不再把 <repo>\src 写进 sys.path。
+          #    不补这一句，Nuitka 会把 __main__.py 当孤立脚本编译 —— 不报错、不告警，
+          #    但 exe 里一个 mscm 模块都没有，双击就是「没反应、连日志都没有」。
+          #    --output-folder-name=main 钉死产出目录：后续校验、组装、缓存都按 main.dist 取路径。
+          $env:PYTHONPATH = (Join-Path $env:GITHUB_WORKSPACE 'src') + ';' + $env:PYTHONPATH
+
+          $nuitkaArgs = @(
+            '--standalone',
+            '--assume-yes-for-downloads',
+            "--output-filename=$env:APP_EXE_NAME",
+            '--output-folder-name=main',
+            '--main=src/mscm/__main__.py',
+            '--msvc=latest',
+            # 台账工具：双击不要黑框，也不要 UAC
+            '--windows-console-mode=disable',
+            '--enable-plugin=pyside6',
+            # 双保险：显式整包收录，避免函数内延迟 import 被漏掉
+            '--include-package=mscm',
+            "--windows-file-version=$env:FILE_VERSION",
+            "--windows-product-version=$env:FILE_VERSION",
+            '--windows-file-description=羊供应链管理系统',
+            '--windows-product-name=羊供应链管理系统',
+            '--windows-company-name=富民锐泽农业科技有限公司'
+          )
+          if ($env:ICON_FULL) {
+            $nuitkaArgs += "--windows-icon-from-ico=$env:ICON_FULL"
+          }
+
+          & $env:PYTHON_VENV -m nuitka @nuitkaArgs
+          if ($LASTEXITCODE -ne 0) { throw "Nuitka 打包失败（退出码 $LASTEXITCODE）" }
+
+      - name: 校验打包产物
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'main.dist'
+          $exe  = Join-Path $dist "$env:APP_EXE_NAME.exe"
+          if (-not (Test-Path $exe)) {
+            $found = @(Get-ChildItem $env:GITHUB_WORKSPACE -Directory -Filter '*.dist' -ErrorAction SilentlyContinue |
+                       ForEach-Object { $_.Name })
+            $hint = if ($found.Count -gt 0) { "实际存在的 .dist 目录：$($found -join ', ')" } else { '工作区里没有任何 .dist 目录（打包环节没产出）' }
+            throw "未找到主程序：$exe；$hint"
+          }
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          $files = [System.IO.Directory]::GetFiles($dist, '*', 'AllDirectories').Count
+          Write-Host "主程序：$exe（$size MB，目录内 $files 个文件）"
+
+          # 空包检查：编译后的模块名常量应留在主 exe 里；一个都没有 = mscm 包没被收录
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $text  = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+          $probes = @('mscm.config', 'mscm.core.db', 'mscm.ui.main_window', 'mscm.ui.pages.dashboard')
+          $hit = @($probes | Where-Object { $text.Contains($_) })
+          if ($hit.Count -eq 0) {
+            throw "打包产物里找不到任何 mscm 模块名（$($probes -join ' / ')）—— 包没被收录，exe 一启动就会 ModuleNotFoundError。请检查打包步骤是否把 <repo>\src 放进了 PYTHONPATH。"
+          }
+          Write-Host "空包检查通过：exe 内含 $($hit -join ', ')"
+
+          # Qt 运行库与 platform 插件是 GUI 能起来的前提：缺了就是「双击没反应」
+          $qtw = @(Get-ChildItem $dist -Filter 'Qt6Widgets*' -Recurse -File -ErrorAction SilentlyContinue)
+          if ($qtw.Count -eq 0) { throw 'main.dist 里没有 Qt6Widgets 运行库：PySide6 插件没生效' }
+          $qwin = @(Get-ChildItem $dist -Filter 'qwindows.dll' -Recurse -File -ErrorAction SilentlyContinue)
+          if ($qwin.Count -eq 0) { throw 'main.dist 里没有 qwindows.dll（Qt platform 插件缺失）：exe 启动会报 "could not find or load the Qt platform plugin"' }
+          Write-Host "Qt 运行库检查通过：$($qtw.Count) 个 Qt6Widgets 文件，qwindows.dll 在 $($qwin[0].DirectoryName)"
+
+      # ------------------------------------------------------------------
+      # 3. 组装程序目录（安装包的 SourceDistDir，也可选打成便携版 zip）
+      # ------------------------------------------------------------------
+      - name: 组装程序目录
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          $dist   = Join-Path $env:GITHUB_WORKSPACE 'main.dist'
+          $stage  = Join-Path $env:GITHUB_WORKSPACE 'package_stage'
+          $appDir = Join-Path $stage $env:APP_EXE_NAME
+          # 只清本次 run 的临时目录，不触碰任何历史产物
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          New-Item -ItemType Directory -Path $appDir -Force | Out-Null
+          Copy-Item (Join-Path $dist '*') $appDir -Recurse -Force
+
+          $lines = New-Object System.Collections.Generic.List[string]
+          $lines.Add('羊供应链管理系统（Mutton Supply Chain MS）')
+          $lines.Add('活羊采购 · 屠宰 · 门店 一体化台账')
+          $lines.Add('')
+          $lines.Add("版本：$env:APP_VERSION")
+          $lines.Add("文件版本：$env:FILE_VERSION")
+          $lines.Add("构建时间：$env:BUILT_AT")
+          $lines.Add("提交：$env:GITHUB_SHA")
+          $lines.Add("运行编号：#$env:GITHUB_RUN_NUMBER")
+          $lines.Add('')
+          $lines.Add("启动：双击 $env:APP_EXE_NAME.exe")
+          $lines.Add('数据：同目录 data\mscm.mscm.json（首次启动自动建立示例账套），备份在 data\backup\')
+          $lines.Add('导出：同目录 导出报表\')
+          $lines.Add('')
+          $lines.Add('本目录为免安装版：整体拷到任意可写位置即可用，不需要 Python 环境。')
+          [System.IO.File]::WriteAllLines((Join-Path $appDir 'VERSION.txt'), $lines.ToArray(), $utf8NoBom)
+
+      - name: 生成便携版 zip
+        if: ${{ inputs.upload_portable_zip == 'true' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage   = Join-Path $env:GITHUB_WORKSPACE 'package_stage'
+          $release = Join-Path $env:GITHUB_WORKSPACE 'release'
+          New-Item -ItemType Directory -Path $release -Force | Out-Null
+          $zip = Join-Path $release $env:ZIP_NAME
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (Test-Path $sevenZip) {
+            Push-Location $stage
+            try {
+              & $sevenZip a -tzip -mx=5 $zip $env:APP_EXE_NAME
+              if ($LASTEXITCODE -ne 0) { throw "7-Zip 压缩失败（退出码 $LASTEXITCODE）" }
+            } finally { Pop-Location }
+          } else {
+            Compress-Archive -Path (Join-Path $stage $env:APP_EXE_NAME) -DestinationPath $zip -CompressionLevel Optimal
+          }
+          if (-not (Test-Path $zip)) { throw "未生成便携版压缩包：$zip" }
+          $size = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          Write-Host "便携版：$zip（$size MB）"
+
+      # ------------------------------------------------------------------
+      # 4. Inno Setup 6 安装包（版本号 / 路径由 /D 注入，见 .github/inno/*.iss）
+      # ------------------------------------------------------------------
+      - name: 生成安装包（Inno Setup 6）
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 运行器一般自带 Inno Setup 6；找不到就递归搜常见目录，再用 Chocolatey 装
+          $candidates = @(
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+            'C:\Program Files\Inno Setup 6\ISCC.exe',
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
+          )
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            $iscc = (Get-ChildItem 'C:\Program Files (x86)', 'C:\Program Files' -Filter 'ISCC.exe' -Recurse -ErrorAction SilentlyContinue |
+                     Select-Object -First 1).FullName
+          }
+          if (-not $iscc) {
+            Write-Host '未找到 Inno Setup，尝试通过 Chocolatey 安装'
+            choco install innosetup -y --no-progress
+            $iscc = (Get-ChildItem 'C:\Program Files (x86)', 'C:\Program Files' -Filter 'ISCC.exe' -Recurse -ErrorAction SilentlyContinue |
+                     Select-Object -First 1).FullName
+          }
+          if (-not $iscc) { throw '未找到 ISCC.exe，无法生成安装包' }
+          Write-Host "使用编译器：$iscc（版本 $((Get-Item $iscc).VersionInfo.FileVersion)）"
+
+          # 中文语言包是 6.5+ 的，运行器自带的 Inno 可能更老（读不了会报「未知消息名」）。
+          # 先试一次升级到 6.5；升级失败不中断，后面还有英文向导兜底。
+          $rawVer = [string](Get-Item $iscc).VersionInfo.FileVersion
+          $mVer = [regex]::Match($rawVer, '^\d+(\.\d+){1,3}')
+          $curVer = if ($mVer.Success) { [version]$mVer.Value } else { $null }
+          if (-not $curVer -or $curVer -lt [version]'6.5') {
+            Write-Host "当前 ISCC 版本 $rawVer 低于 6.5：尝试升级以获得简体中文向导"
+            choco install innosetup --version=6.5.0 -y --no-progress --allow-downgrade
+            if ($LASTEXITCODE -eq 0) {
+              $upgraded = @(
+                'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+                'C:\Program Files\Inno Setup 6\ISCC.exe'
+              ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+              if ($upgraded) { $iscc = $upgraded }
+              Write-Host "升级后编译器：$iscc（版本 $((Get-Item $iscc).VersionInfo.FileVersion)）"
+            } else {
+              Write-Host '[WARN] 升级 Inno Setup 失败，继续用现有版本（必要时用英文向导兜底）'
+            }
+          }
+
+          $script = Join-Path $env:GITHUB_WORKSPACE '.github\inno\Mutton_Supply_Chain_MS.iss'
+          $lang   = Join-Path $env:GITHUB_WORKSPACE '.github\inno\ChineseSimplified.isl'
+          if (-not (Test-Path $script)) { throw "找不到 Inno 脚本：$script" }
+          if (-not (Test-Path $lang))   { throw "找不到中文语言包：$lang" }
+
+          $isccArgs = @(
+            "/DMyAppVersion=$env:APP_VERSION",
+            "/DVersionInfoVersion=$env:FILE_VERSION",
+            "/DOutputBaseFilename=$env:SETUP_BASE",
+            "/DMyAppExeName=$env:APP_EXE_NAME.exe",
+            "/DSourceDistDir=$env:GITHUB_WORKSPACE\package_stage\$env:APP_EXE_NAME",
+            "/DRepoRoot=$env:GITHUB_WORKSPACE"
+          )
+          # 图标预留：填了 icon_path 就同时用于 exe 和安装向导
+          if ($env:ICON_FULL) { $isccArgs += "/DMySetupIcon=$env:ICON_FULL" }
+
+          & $iscc @isccArgs $script
+          if ($LASTEXITCODE -ne 0) {
+            # 兜底：运行器自带 Inno 版本过旧、读不了 6.5+ 中文语言包时，改英文向导重编
+            Write-Host '中文语言包编译失败，改用 Inno 自带英文语言重试'
+            & $iscc @isccArgs '/DUseEnglishOnly' $script
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败（退出码 $LASTEXITCODE）" }
+          }
+
+          $setup = Join-Path $env:GITHUB_WORKSPACE "release\$env:SETUP_NAME"
+          if (-not (Test-Path $setup)) { throw "未生成安装包：$setup" }
+          $size    = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+          $product = ([string](Get-Item $setup).VersionInfo.ProductVersion).Trim()
+          $name    = ([string](Get-Item $setup).VersionInfo.ProductName).Trim()
+          Write-Host "安装包：$setup（$size MB，产品名 $name，显示版本 $env:APP_VERSION，文件版本 $product）"
+          if ($product -ne $env:FILE_VERSION) {
+            Write-Host "[WARN] 文件版本与期望 $env:FILE_VERSION 不一致（不中断构建）"
+          }
+
+      # ------------------------------------------------------------------
+      # 5. 上传 Artifact（不覆盖、不删除任何历史产物 / 运行记录）
+      # ------------------------------------------------------------------
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: |
+            release/*.exe
+            release/*.zip
+          if-no-files-found: error
+          # exe / zip 本身已压缩，再压一遍纯浪费时间
+          compression-level: 0
+          retention-days: 90
+
+      - name: 上传 main.dist（排查用）
+        if: ${{ inputs.upload_debug_artifact == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.dist_artifact_name }}
+          path: main.dist
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 写入构建摘要
+        env:
+          UPLOAD_ZIP: ${{ inputs.upload_portable_zip }}
+          UPLOAD_DEBUG_ARTIFACT: ${{ inputs.upload_debug_artifact }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup     = Join-Path $env:GITHUB_WORKSPACE "release\$env:SETUP_NAME"
+          $setupSize = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+          $iconLabel = if ($env:ICON_FULL) { "``$env:ICON_FULL``" } else { '未设置（项目暂无 .ico，用系统默认图标）' }
+
+          $summary = New-Object System.Collections.Generic.List[string]
+          $summary.Add("## 构建完成：羊供应链管理系统 $env:APP_VERSION")
+          $summary.Add('')
+          $summary.Add("- 安装包：``$env:SETUP_NAME``（$setupSize MB）")
+          $summary.Add("- 显示版本：``$env:APP_VERSION`` · 文件版本：``$env:FILE_VERSION``")
+          $summary.Add("- 主程序：``$env:APP_EXE_NAME.exe``（无控制台、无 UAC 提权）")
+          $summary.Add("- 图标：$iconLabel")
+          $summary.Add("- 构建时间：$env:BUILT_AT")
+          $summary.Add("- 提交：``$env:GITHUB_SHA`` · 运行：``#$env:GITHUB_RUN_NUMBER``")
+          $summary.Add('')
+          $summary.Add('### 本次产物')
+          $summary.Add('')
+          $summary.Add("- Artifact：``$env:ARTIFACT_NAME``")
+          if ($env:UPLOAD_ZIP -eq 'true') {
+            $zip     = Join-Path $env:GITHUB_WORKSPACE "release\$env:ZIP_NAME"
+            $zipSize = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+            $summary.Add("- 便携版：``$env:ZIP_NAME``（$zipSize MB）")
+          }
+          if ($env:UPLOAD_DEBUG_ARTIFACT -eq 'true') {
+            $summary.Add("- 排查产物：``$env:DIST_ARTIFACT``（main.dist）")
+          }
+          $summary.Add('')
+          $summary.Add('### 安装说明')
+          $summary.Add('')
+          $summary.Add('- 双击安装包 → 中文向导 → 默认装到 `C:\Program Files\Mutton_Supply_Chain_MS`')
+          $summary.Add('- 数据与导出报表默认落在程序目录下（`data\` / `导出报表\`），安装时已给普通用户写权限')
+          $summary.Add('- 卸载走「设置 › 应用」，**不会**删除 `data\` 里的账套文件')
+          $summary.Add('')
+          $summary.Add('> 历次 Artifact 与运行记录均保留，本流程不清理、不覆盖；本次产物保留 90 天。')
+          [System.IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, $summary.ToArray(), (New-Object System.Text.UTF8Encoding $false))

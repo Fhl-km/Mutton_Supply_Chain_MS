@@ -13,6 +13,19 @@ from mscm.ui import theme
 from mscm.ui.main_window import MainWindow
 
 
+def _log(message: str) -> None:
+    """启动日志。
+
+    打包成窗口程序（无控制台）后 ``sys.stdout`` 可能是 None，直接 print 会
+    抛 AttributeError 把程序带崩在启动阶段，所以这里一律吞掉写失败。
+    """
+    try:
+        if sys.stdout is not None:
+            print(f"[init] {message}", flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 def run(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv
     config.ensure_dirs()
@@ -27,7 +40,7 @@ def run(argv: list[str] | None = None) -> int:
     conn = open_database()
     result = ensure_seed_data(conn)
     if result.message:
-        print(f"[init] {result.message}")
+        _log(result.message)
 
     win = MainWindow(conn)
     win.showMaximized()

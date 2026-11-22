@@ -4,3 +4,12 @@ __pycache__/
 data/
 导出报表/
 ~$*
+
+# 打包过程产物（GitHub Actions / 本地构建都往这里写，不进版本库）
+main.dist/
+main.build/
+main.onefile-build/
+package_stage/
+release/
+*.dist/
+*.build/

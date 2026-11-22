@@ -15,8 +15,18 @@ COMPANY = "富民锐泽农业科技有限公司"
 DATA_SUFFIX = ".mscm.json"
 
 
+def _frozen() -> bool:
+    """是否跑在打包产物里。
+
+    Nuitka 会在编译后的模块里放 ``__compiled__``；``sys.frozen`` 是 PyInstaller
+    的口径，Nuitka 不一定设。两个都认，免得打包后 ROOT 算到临时目录去，
+    账套文件就找不到 / 存到奇怪的地方。
+    """
+    return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+
+
 def _project_root() -> Path:
-    if getattr(sys, "frozen", False):          # PyInstaller / Nuitka 打包后
+    if _frozen():                              # PyInstaller / Nuitka 打包后
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[2]
 
