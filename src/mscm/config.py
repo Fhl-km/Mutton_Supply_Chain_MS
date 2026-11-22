@@ -8,7 +8,7 @@ from pathlib import Path
 
 APP_NAME = "羊供应链管理系统"
 APP_SUBTITLE = "活羊采购 · 屠宰 · 门店 一体化台账"
-APP_VERSION = "1.6.202611221735"
+APP_VERSION = "1.6.202611221751"
 COMPANY = "富民锐泽农业科技有限公司"
 
 # 自动更新：版本信息文件地址。文件内容一行三段：版本号 安装包直链 [sha256]。
