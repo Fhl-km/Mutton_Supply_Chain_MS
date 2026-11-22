@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mutton-supply-chain-ms"
-version = "1.6.202611221751"
+version = "1.6.202611221819"
 description = "羊供应链管理系统 —— 活羊采购 / 屠宰 / 门店 一体化台账"
 readme = "README.md"
 requires-python = ">=3.10"
