@@ -13,7 +13,7 @@ COMPANY = "富民锐泽农业科技有限公司"
 
 # 自动更新：版本信息文件地址。文件内容一行三段：版本号 安装包直链 [sha256]。
 # 留空时不检查更新（不会联网、不弹任何提示）；发布时填真实网址即可。
-UPDATE_CHECK_URL = ""
+UPDATE_CHECK_URL = "https://fhlwebsite.pages.dev/Mutton_Supply_Chain_MS_check_update.txt"
 
 # 数据文件扩展名：mscm = Mutton Supply Chain Management
 DATA_SUFFIX = ".mscm.json"
