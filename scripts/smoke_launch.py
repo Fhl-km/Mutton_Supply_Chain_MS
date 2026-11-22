@@ -1,6 +1,9 @@
-"""启动入口冒烟：真正跑一遍 `python -m mscm`，5 秒后自动关掉。
+"""启动入口冒烟：真正跑一遍 `python -m mscm`，等账套文件出现后自动关掉。
 
 用临时数据目录，避免污染工作区的 data/ 与 导出报表/。
+
+注意：不要用「固定 N 秒后杀进程」。冷启动时 import PySide6 + 建主窗口可能超过 6 秒，
+杀掉时账套还没落盘，会偶发假失败。这里改成轮询等 mscm.mscm.json 出现（最多 20 秒）。
 """
 
 from __future__ import annotations
@@ -9,11 +12,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PY = ROOT / ".venv" / "Scripts" / "python.exe"
 TMP = Path(tempfile.mkdtemp(prefix="mscm_run_"))
+DATA_FILE = TMP / "data" / "mscm.mscm.json"
 
 env = dict(os.environ)
 env["PYTHONPATH"] = str(ROOT / "src")
@@ -22,13 +27,21 @@ env["QT_QPA_PLATFORM"] = "offscreen"
 
 proc = subprocess.Popen([str(PY), "-m", "mscm"], env=env, cwd=str(ROOT),
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+deadline = time.time() + 20
+while time.time() < deadline and proc.poll() is None and not DATA_FILE.exists():
+    time.sleep(0.2)
+
+# 账套已落盘 → 再给主窗口一点时间收尾，然后收工
+if DATA_FILE.exists():
+    time.sleep(0.5)
 try:
-    out, err = proc.communicate(timeout=6)
-    code = proc.returncode
-except subprocess.TimeoutExpired:
     proc.terminate()
+    out, err = proc.communicate(timeout=10)
+except subprocess.TimeoutExpired:
+    proc.kill()
     out, err = proc.communicate(timeout=5)
-    code = proc.returncode
+code = proc.returncode
 
 print("[stdout]", out.strip())
 print("[stderr]", err.strip()[:2000])

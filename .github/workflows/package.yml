@@ -359,20 +359,37 @@ jobs:
           New-Item -ItemType Directory -Path $appDir -Force | Out-Null
           Copy-Item (Join-Path $dist '*') $appDir -Recurse -Force
 
-          # 安全闸：产物目录里绝不能出现 data\ / 导出报表\ / *.mscm.json。
-          # 一旦出现，说明有人在构建目录里跑过程序 —— 打出去既是账套泄漏，
-          # 装的时候还可能把用户的账套按「安装文件」覆盖掉。宁可构建失败。
+          # 安全闸：安装包只允许「程序文件」。构建目录里绝不该出现账套、报表、开发脚本与仓库文档。
+          # 出现就说明有人在 main.dist 里跑过程序 / 手动塞过东西 —— 打出去既是数据泄漏，
+          # 装的时候还可能把用户账套当「安装文件」覆盖。宁可构建失败。
           $stray = New-Object System.Collections.Generic.List[string]
-          foreach ($sub in @('data', '导出报表')) {
-            if (Test-Path (Join-Path $appDir $sub)) { $stray.Add($sub) }
+          foreach ($sub in @('data', '导出报表', 'scripts', 'src', '__pycache__', '.git', '.github', '.workbuddy')) {
+            if (Test-Path (Join-Path $appDir $sub)) { $stray.Add($sub + '\') }
           }
-          foreach ($f in @(Get-ChildItem $appDir -Recurse -File -Filter '*.mscm.json' -ErrorAction SilentlyContinue)) {
-            $stray.Add($f.FullName.Substring($appDir.Length + 1))
+          # 只按「数据 / 文档 / 配置」类扩展名和仓库文件名拦；.py 不拦（个别 Qt 附带的脚本不该因它误判），
+          # 源码泄漏由上面的目录级拦截（src\ scripts\ .github\）负责
+          $banExt = @('.mscm.json', '.xlsx', '.xls', '.csv', '.log', '.db', '.sqlite', '.md', '.toml', '.bat')
+          $banName = @('客户名录.xlsx', '账表记录-羊.xlsx', '运行.bat', 'pyproject.toml')
+          foreach ($f in @(Get-ChildItem $appDir -Recurse -File -ErrorAction SilentlyContinue)) {
+            $n = $f.Name.ToLower()
+            $rel = $f.FullName.Substring($appDir.Length + 1)
+            $hitExt = $false
+            foreach ($e in $banExt) { if ($n.EndsWith($e)) { $hitExt = $true; break } }
+            if ($hitExt -or ($banName | Where-Object { $n -eq $_.ToLower() })) { $stray.Add($rel) }
           }
           if ($stray.Count -gt 0) {
-            throw "打包目录里混进了账套数据：$($stray -join ', ')。构建目录（main.dist）里跑过程序，请先清干净再重跑 —— 绝不能把账套打进安装包。"
+            $head = ($stray | Select-Object -First 10) -join ', '
+            throw "打包目录里混进了非程序文件：$head（共 $($stray.Count) 项）。安装包只该有 exe + 运行库，请清掉 main.dist 里的数据/脚本后重跑。"
           }
-          Write-Host '安全闸通过：产物目录里没有任何账套数据'
+
+          # 清单公示：包内到底有什么，一眼能看（排查「是不是把开发数据打进去了」全靠它）
+          $all = @(Get-ChildItem $appDir -Recurse -File)
+          $sum = ($all | Measure-Object -Property Length -Sum).Sum
+          $mb = [math]::Round($sum / 1MB, 1)
+          $byExt = ($all | Group-Object Extension | Sort-Object Count -Descending | Select-Object -First 6 |
+                    ForEach-Object { "$(if ($_.Name) { $_.Name } else { '(无扩展名)' })=$($_.Count)" }) -join ', '
+          Write-Host "安全闸通过：包内 $($all.Count) 个文件、$mb MB；扩展名分布：$byExt"
+          Write-Host "包内无 data / 导出报表 / xlsx / csv / 日志 / 脚本"
 
           $lines = New-Object System.Collections.Generic.List[string]
           $lines.Add('羊供应链管理系统（Mutton Supply Chain MS）')
