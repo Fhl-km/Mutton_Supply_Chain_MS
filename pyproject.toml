@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mutton-supply-chain-ms"
+version = "1.2.0"
+description = "羊供应链管理系统 —— 活羊采购 / 屠宰 / 门店 一体化台账"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "云南君荣会计师事务所（普通合伙）" }]
+dependencies = [
+    "PySide6>=6.6",
+    "openpyxl>=3.1",
+]
+
+[project.scripts]
+mscm = "mscm.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
